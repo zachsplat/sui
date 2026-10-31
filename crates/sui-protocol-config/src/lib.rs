@@ -433,6 +433,7 @@ const MAINNET_USDB: &str =
 //              Reject an overflowing x-coordinate in `secp256r1_ecrecover`.
 //              Configure explicit Move binary format encoding limits.
 //              Enable defer_owned_object_double_spend on all networks.
+//              Enable timestamp-based transaction expiration on devnet.
 
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
@@ -1369,6 +1370,12 @@ struct FeatureFlags {
     // id.
     #[serde(skip_serializing_if = "is_false")]
     disable_id_leak_verifier: bool,
+
+    // If true, `min_timestamp` and `max_timestamp` in `ValidDuring` and `Validity` expirations
+    // are accepted. The consensus handler drops a transaction whose commit timestamp is outside
+    // the window when the transaction is first sequenced.
+    #[serde(skip_serializing_if = "is_false")]
+    enable_timestamp_transaction_expiration: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -4981,6 +4988,9 @@ impl ProtocolConfig {
                     cfg.feature_flags.secp256r1_ecrecover_checks_x_below_p = true;
                     cfg.binary_format_limits_profile = Some(BinaryFormatLimitsProfile::V1);
                     cfg.feature_flags.defer_owned_object_double_spend = true;
+                    if chain != Chain::Mainnet && chain != Chain::Testnet {
+                        cfg.feature_flags.enable_timestamp_transaction_expiration = true;
+                    }
                 }
                 // Use this template when making changes:
                 //
