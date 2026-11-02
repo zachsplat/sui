@@ -1373,7 +1373,8 @@ struct FeatureFlags {
 
     // If true, `min_timestamp` and `max_timestamp` in `ValidDuring` and `Validity` expirations
     // are accepted. The consensus handler drops a transaction whose commit timestamp is outside
-    // the window when the transaction is first sequenced.
+    // the window when the transaction is first sequenced, and execution aborts a deferred
+    // transaction whose assigned Clock is outside the window.
     #[serde(skip_serializing_if = "is_false")]
     enable_timestamp_transaction_expiration: bool,
 }
