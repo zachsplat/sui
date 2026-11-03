@@ -75,13 +75,14 @@ use sui_types::effects::{
     TransactionEffectsAPI, TransactionEvents,
 };
 use sui_types::execution_status::ExecutionErrorKind;
+use sui_types::full_checkpoint_content::ObjectSet;
 use sui_types::messages_checkpoint::{
     CheckpointContents, CheckpointContentsDigest, CheckpointSequenceNumber, VerifiedCheckpoint,
 };
 use sui_types::messages_consensus::ConsensusDeterminedVersionAssignments;
 use sui_types::object::bounded_visitor::BoundedVisitor;
 use sui_types::storage::ReadStore;
-use sui_types::storage::{ObjectStore, RpcStateReader};
+use sui_types::storage::{ObjectKey, ObjectStore, RpcStateReader};
 use sui_types::transaction::Command;
 use sui_types::transaction::ProgrammableTransaction;
 use sui_types::transaction_executor::SimulateTransactionResult;
@@ -2203,10 +2204,13 @@ impl SuiTestAdapter {
 
     async fn dry_run(&mut self, transaction: TransactionData) -> anyhow::Result<TxnSummary> {
         let SimulateTransactionResult {
-            effects, events, ..
+            effects,
+            events,
+            objects,
+            ..
         } = self.executor.dry_run_transaction_block(transaction).await?;
 
-        self.tx_summary_from_effects(effects, events.unwrap_or_default())
+        self.tx_summary_from_effects(effects, events.unwrap_or_default(), &objects)
     }
 
     async fn dev_inspect(
@@ -2216,13 +2220,16 @@ impl SuiTestAdapter {
         gas_price: Option<u64>,
     ) -> anyhow::Result<TxnSummary> {
         let SimulateTransactionResult {
-            effects, events, ..
+            effects,
+            events,
+            objects,
+            ..
         } = self
             .executor
             .dev_inspect_transaction_block(sender, transaction_kind, gas_price)
             .await?;
 
-        self.tx_summary_from_effects(effects, events.unwrap_or_default())
+        self.tx_summary_from_effects(effects, events.unwrap_or_default(), &objects)
     }
 
     /// Summarize the effects of a simulated (dry-run or dev-inspect) transaction.
@@ -2230,6 +2237,7 @@ impl SuiTestAdapter {
         &mut self,
         effects: TransactionEffects,
         events: TransactionEvents,
+        objects: &ObjectSet,
     ) -> anyhow::Result<TxnSummary> {
         if let ExecutionStatus::Failure(ExecutionFailure { error, command }) = effects.status() {
             // Match the error rendering of the JSON-RPC effects these summaries used to be
@@ -2283,15 +2291,22 @@ impl SuiTestAdapter {
 
         self.record_creation_order(effects.transaction_digest(), &created_ids);
 
-        // make sure objects that have previously not been in storage get assigned a fake id.
-        let mut might_need_fake_id: Vec<_> = created_ids
-            .iter()
-            .chain(unwrapped_ids.iter())
-            .copied()
-            .collect();
+        // `created_ids` and `unwrapped_ids` discard the output versions needed to retrieve
+        // simulated outputs, which are not persisted in backing storage.
+        let mut might_need_fake_id = effects
+            .created()
+            .into_iter()
+            .chain(effects.unwrapped())
+            .map(|((id, version, _), _)| {
+                objects.get(&ObjectKey(id, version)).ok_or_else(|| {
+                    anyhow!("Simulation output object {id} at version {version} is missing")
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
-        // Use a stable sort before assigning fake ids, so test output remains stable.
-        might_need_fake_id.sort_by_key(|id| self.get_object_sorting_key(id));
+        // Use the same ordering as committed transactions without reading unpersisted outputs
+        // from backing storage.
+        might_need_fake_id.sort_by_key(|object| self.get_object_sorting_key_from_object(object));
         accumulators_written.sort_by_key(|(_, address, ty, _, _)| {
             (
                 self.stabilize_str(format!("{}", address)),
@@ -2299,13 +2314,15 @@ impl SuiTestAdapter {
             )
         });
 
-        might_need_fake_id.extend(
-            accumulators_written
-                .iter()
-                .map(|(obj_id, _, _, _, _)| *obj_id),
-        );
-
-        for id in might_need_fake_id {
+        for id in might_need_fake_id
+            .into_iter()
+            .map(|object| object.id())
+            .chain(
+                accumulators_written
+                    .iter()
+                    .map(|(obj_id, _, _, _, _)| *obj_id),
+            )
+        {
             self.enumerate_fake(id);
         }
 
@@ -2377,8 +2394,13 @@ impl SuiTestAdapter {
     // thus have no creation order) will be sorted at the end, and among them the ones of the same
     // type will be sorted together.
     fn get_object_sorting_key(&self, id: &ObjectID) -> (u64, String, ObjectID) {
-        let creation_id = self.creation_order.get(id).copied().unwrap_or(u64::MAX);
-        let type_key = match &self.get_object(id, None).unwrap().data {
+        self.get_object_sorting_key_from_object(&self.get_object(id, None).unwrap())
+    }
+
+    fn get_object_sorting_key_from_object(&self, object: &Object) -> (u64, String, ObjectID) {
+        let id = object.id();
+        let creation_id = self.creation_order.get(&id).copied().unwrap_or(u64::MAX);
+        let type_key = match &object.data {
             object::Data::Move(obj) => self.stabilize_str(format!("{}", obj.type_())),
             object::Data::Package(pkg) => pkg
                 .serialized_module_map()
@@ -2389,7 +2411,7 @@ impl SuiTestAdapter {
         };
         // ObjectID as final tiebreaker for objects with the same creation order and type
         // (e.g., dynamic field objects whose IDs are derived from parent+key, not fresh_id).
-        (creation_id, type_key, *id)
+        (creation_id, type_key, id)
     }
 
     pub(crate) fn fake_to_real_object_id(&self, fake_id: FakeID) -> Option<ObjectID> {
