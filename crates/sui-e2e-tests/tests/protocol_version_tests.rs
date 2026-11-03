@@ -73,8 +73,8 @@ mod sim_only_tests {
     use sui_protocol_config::Chain;
     use sui_rpc::field::{FieldMask, FieldMaskUtil};
     use sui_rpc::proto::sui::rpc::v2::{
-        GetPackageRequest, GetTransactionRequest, get_package_request::Selector,
-        ledger_service_client::LedgerServiceClient,
+        GetPackageRequest, GetTransactionRequest, ListSystemPackagesRequest, PackageVersion,
+        get_package_request::Selector, ledger_service_client::LedgerServiceClient,
         move_package_service_client::MovePackageServiceClient,
     };
     use sui_types::base_types::ConciseableName;
@@ -366,6 +366,69 @@ mod sim_only_tests {
         assert_eq!(Some(SequenceNumber::from(2)), mutated_to);
     }
 
+    /// `ListSystemPackages` answers with the sui-system package's version as of the requested
+    /// checkpoint across its in-place upgrade, which lands in the last checkpoint of epoch 0.
+    #[sim_test]
+    async fn test_list_system_packages_across_framework_upgrade() {
+        let cluster = framework_upgrade_cluster("extend/base", "extend/compatible")
+            .await
+            // Keep epoch 0's object history, which the reads below need after it has ended.
+            .disable_fullnode_pruning()
+            .build()
+            .await;
+        expect_upgrade_succeeded(&cluster).await;
+        cluster.wait_for_rpc_index_ready().await;
+
+        let upgrade_checkpoint = cluster.fullnode_handle.sui_node.with(|node| {
+            node.state()
+                .get_checkpoint_store()
+                .get_epoch_last_checkpoint_seq_number(0)
+                .unwrap()
+                .unwrap()
+        });
+
+        let before = list_system_packages_at(&cluster, upgrade_checkpoint - 1).await;
+        let after = list_system_packages_at(&cluster, upgrade_checkpoint).await;
+
+        // Genesis publishes version 1 at checkpoint 0, and the upgrade publishes version 2 in
+        // the last checkpoint of epoch 0.
+        let sui_system_id = SUI_SYSTEM_PACKAGE_ID.to_canonical_string(true);
+        let sui_system_at = |version, checkpoint| {
+            PackageVersion::new(&SUI_SYSTEM_PACKAGE_ID.into(), version)
+                .with_checkpoint(checkpoint)
+                .with_original_id(sui_system_id.clone())
+        };
+        assert!(before.contains(&sui_system_at(1, 0)), "{before:?}");
+        assert!(
+            after.contains(&sui_system_at(2, upgrade_checkpoint)),
+            "{after:?}"
+        );
+
+        // Only the sui-system package is upgraded.
+        let others = |packages: &[PackageVersion]| {
+            packages
+                .iter()
+                .filter(|p| p.original_id.as_ref() != Some(&sui_system_id))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(others(&before), others(&after));
+    }
+
+    async fn list_system_packages_at(
+        cluster: &TestCluster,
+        at_checkpoint: u64,
+    ) -> Vec<PackageVersion> {
+        MovePackageServiceClient::connect(cluster.rpc_url().to_owned())
+            .await
+            .unwrap()
+            .list_system_packages(ListSystemPackagesRequest::new(at_checkpoint))
+            .await
+            .unwrap()
+            .into_inner()
+            .system_packages
+    }
+
     #[sim_test]
     async fn test_get_package_serves_system_package_versions_replaced_in_place() {
         ProtocolConfig::poison_get_for_min_version();
@@ -584,6 +647,12 @@ mod sim_only_tests {
     }
 
     async fn run_framework_upgrade(from: &str, to: &str) -> TestCluster {
+        framework_upgrade_cluster(from, to).await.build().await
+    }
+
+    /// A cluster that starts with the sui-system package built from `from` and upgrades it in
+    /// place to the one built from `to` at the end of epoch 0.
+    async fn framework_upgrade_cluster(from: &str, to: &str) -> TestClusterBuilder {
         ProtocolConfig::poison_get_for_min_version();
 
         override_sui_system_modules(to).await;
@@ -593,8 +662,6 @@ mod sim_only_tests {
             .with_supported_protocol_versions(SupportedProtocolVersions::new_for_testing(
                 START, FINISH,
             ))
-            .build()
-            .await
     }
 
     async fn call_canary(cluster: &TestCluster) -> u64 {
