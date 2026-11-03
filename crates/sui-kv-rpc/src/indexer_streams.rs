@@ -177,15 +177,21 @@ mod tests {
     use sui_kvstore::BigTableClient;
     use sui_kvstore::EPOCH_END_PIPELINE;
     use sui_kvstore::OBJECTS_PIPELINE;
+    use sui_kvstore::SYSTEM_PACKAGES_PIPELINE;
     use sui_kvstore::WatermarkV1;
     use sui_kvstore::rpc::RpcService;
     use sui_kvstore::rpc::proto::v1alpha::watermark_service_server::WatermarkServiceServer;
     use sui_kvstore::rpc::watermark_service::WatermarkService;
+    use sui_kvstore::tables;
     use sui_kvstore::testing::MockBigtableServer;
     use sui_rpc::proto::sui::rpc::v2::GetServiceInfoRequest;
     use sui_rpc::proto::sui::rpc::v2::GetServiceInfoResponse;
+    use sui_rpc::proto::sui::rpc::v2::ListSystemPackagesRequest;
+    use sui_rpc::proto::sui::rpc::v2::PackageVersion;
     use sui_rpc::proto::sui::rpc::v2::ledger_service_server::LedgerService;
+    use sui_rpc::proto::sui::rpc::v2::move_package_service_server::MovePackageService;
     use sui_rpc_api::proto::timestamp_ms_to_proto;
+    use sui_types::base_types::ObjectID;
     use tokio::time::sleep;
     use tokio::time::timeout;
 
@@ -352,6 +358,18 @@ mod tests {
         .map(tonic::Response::into_inner)
     }
 
+    async fn list_system_packages(
+        server: &KvRpcServer,
+        at_checkpoint: u64,
+    ) -> Result<Vec<PackageVersion>, tonic::Status> {
+        MovePackageService::list_system_packages(
+            server,
+            tonic::Request::new(ListSystemPackagesRequest::new(at_checkpoint)),
+        )
+        .await
+        .map(|response| response.into_inner().system_packages)
+    }
+
     #[test]
     fn lowest_watermark_needs_every_pipeline_and_ignores_others() {
         let mut watermarks = HashMap::from([
@@ -468,5 +486,56 @@ mod tests {
         indexer.record(served_watermarks(|_| 30));
         sleep(QUIET_PERIOD).await;
         assert_eq!(cached_checkpoint(&server), Some(20));
+    }
+
+    #[tokio::test]
+    async fn system_packages_pipeline_bounds_the_served_checkpoint() {
+        let mock = MockBigtableServer::new();
+        let (bigtable, _mock_server) = mock.start().await.expect("start mock Bigtable");
+        let framework = ObjectID::from_single_byte(2);
+        mock.insert_row(
+            tables::system_packages::NAME,
+            tables::system_packages::encode_key(framework.as_ref()),
+            tables::system_packages::encode(0),
+        )
+        .await;
+        mock.insert_row(
+            tables::packages::NAME,
+            tables::packages::encode_key(framework.as_ref(), 1),
+            tables::packages::encode(0, framework.as_ref(), true),
+        )
+        .await;
+
+        // The `system_packages` table may lack a package created after its pipeline's watermark,
+        // so while that pipeline lags the others, it holds the served checkpoint back.
+        let indexer = Indexer::start(
+            local_address(),
+            served_watermarks(|pipeline| {
+                if pipeline == SYSTEM_PACKAGES_PIPELINE {
+                    5
+                } else {
+                    20
+                }
+            }),
+        )
+        .await;
+        let (server, _replica) = start_replica(bigtable, vec![indexer.url.clone()]).await;
+        wait_for_served_checkpoint(&server, 5).await;
+        let status = list_system_packages(&server, 20).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+
+        indexer.record(HashMap::from([(
+            SYSTEM_PACKAGES_PIPELINE.to_string(),
+            watermark(25),
+        )]));
+        wait_for_served_checkpoint(&server, 20).await;
+        assert_eq!(
+            list_system_packages(&server, 20).await.unwrap(),
+            vec![
+                PackageVersion::new(&framework.into(), 1)
+                    .with_checkpoint(0)
+                    .with_original_id(framework.to_canonical_string(true))
+            ],
+        );
     }
 }
