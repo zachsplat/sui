@@ -27,11 +27,12 @@
 //! before the available window. Like `package_versions`, the CF is never
 //! pruned.
 //!
-//! Every database open (`RpcStoreSchema::open`) reconciles this CF
-//! against `package_versions`, writing any row that is missing. That
-//! builds the CF for a database created before it existed, and finishes
-//! a build a crash interrupted; see
-//! `RpcStoreSchema::build_packages_by_checkpoint`.
+//! A database open (`RpcStoreSchema::open`) builds this CF from
+//! `package_versions`, writing any row that is missing, until one build
+//! completes. That builds the CF for a database created before it
+//! existed, and finishes a build a crash interrupted. The build records
+//! its completion in [`super::packages_by_checkpoint_built`], and later
+//! opens skip it; see `RpcStoreSchema::build_packages_by_checkpoint`.
 
 use bytes::Buf;
 use bytes::BufMut;
@@ -45,6 +46,7 @@ use sui_types::base_types::ObjectID;
 use sui_types::storage::PackagePublishKey;
 
 use super::package_versions::decode_storage_id;
+use super::primitives::UnitKey;
 
 pub const NAME: &str = "packages_by_checkpoint";
 
@@ -160,17 +162,24 @@ const BUILD_CHUNK_ROWS: usize = 10_000;
 
 impl super::RpcStoreSchema {
     /// Write every row this CF is missing relative to
-    /// [`super::package_versions`], returning the number written.
+    /// [`super::package_versions`] and record that the build completed
+    /// in [`super::packages_by_checkpoint_built`], returning the number
+    /// of rows written.
     ///
-    /// Runs on every database open, before any pipeline can write. It
-    /// scans `package_versions`, projects each row with a known publish
-    /// checkpoint to its key here (restore floors are skipped, as on the
-    /// indexing path), and writes only the keys not already present.
-    /// Work is committed in chunks of [`BUILD_CHUNK_ROWS`]; because every
-    /// write is a put of a row derived from `package_versions`, a crash
-    /// between chunks leaves a subset of the right rows, and the next
-    /// open fills in the rest. On a database whose CF is already
-    /// complete it reads both CFs and writes nothing.
+    /// `RpcStoreSchema::open` runs it, before any pipeline can write,
+    /// until one build completes. It scans `package_versions`, projects
+    /// each row with a known publish checkpoint to its key here (restore
+    /// floors are skipped, as on the indexing path), and writes only the
+    /// keys not already present. Work is committed in chunks of
+    /// [`BUILD_CHUNK_ROWS`]; because every write is a put of a row
+    /// derived from `package_versions`, a crash between chunks leaves a
+    /// subset of the right rows, and the next open fills in the rest.
+    /// The completion row is written in the last chunk's batch, so it
+    /// exists only once every row does.
+    ///
+    /// Later opens can skip the build because, once it has run, every
+    /// write of a `package_versions` row with a known publish checkpoint
+    /// writes its row here in the same batch.
     ///
     /// Only missing rows are added; rows here with no matching
     /// `package_versions` row are left alone. The pipeline writes both
@@ -195,17 +204,24 @@ impl super::RpcStoreSchema {
             let storage_id = decode_storage_id(&info.storage_id)?;
             chunk.push(store(checkpoint, key.original_id, key.version, storage_id));
             if chunk.len() == chunk_rows {
-                written += self.write_missing_rows(db, &chunk)?;
+                written += self.write_missing_rows(db, &chunk, false)?;
                 chunk.clear();
             }
         }
-        written += self.write_missing_rows(db, &chunk)?;
+        written += self.write_missing_rows(db, &chunk, true)?;
         Ok(written)
     }
 
     /// Write the rows of `chunk` whose keys are absent from this CF, in
-    /// one batch, returning how many were written.
-    fn write_missing_rows(&self, db: &Db, chunk: &[(Key, Value)]) -> Result<usize, Error> {
+    /// one batch, returning how many were written. If `last` is set, the
+    /// batch also records that the build completed, and is committed
+    /// even when no row is missing.
+    fn write_missing_rows(
+        &self,
+        db: &Db,
+        chunk: &[(Key, Value)],
+        last: bool,
+    ) -> Result<usize, Error> {
         // One answer per key, in key order.
         let present = self
             .packages_by_checkpoint
@@ -217,7 +233,10 @@ impl super::RpcStoreSchema {
             }
         }
         let written = batch.len();
-        if written > 0 {
+        if last {
+            batch.put(&self.packages_by_checkpoint_built, &UnitKey, &UnitKey)?;
+        }
+        if written > 0 || last {
             batch.commit()?;
         }
         Ok(written)
@@ -308,6 +327,33 @@ mod tests {
             .collect()
     }
 
+    /// Delete the build's completion row, as on a database last opened
+    /// by a binary that predates it or whose build a crash interrupted.
+    fn forget_build(db: &Db, schema: &RpcStoreSchema) {
+        let mut batch = db.batch();
+        batch
+            .delete(&schema.packages_by_checkpoint_built, &UnitKey)
+            .unwrap();
+        batch.commit().unwrap();
+        assert!(!schema.packages_by_checkpoint_built().unwrap());
+    }
+
+    /// `publishes()` as `package_versions` rows, each with its real
+    /// publish checkpoint.
+    fn published_package_versions() -> Vec<(ObjectID, u64, ObjectID, Option<u64>)> {
+        publishes()
+            .into_iter()
+            .map(|(key, storage_id)| {
+                (
+                    key.original_id,
+                    key.version,
+                    storage_id,
+                    Some(key.checkpoint),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn build_indexes_published_versions_and_skips_restore_floors() {
         let (_dir, db, schema) = fresh_db();
@@ -360,23 +406,13 @@ mod tests {
         // Every `package_versions` row of the fixture has a real
         // checkpoint, and the index holds some of them, as a crash
         // between build chunks would leave it.
-        let rows: Vec<_> = publishes()
-            .into_iter()
-            .map(|(key, storage_id)| {
-                (
-                    key.original_id,
-                    key.version,
-                    storage_id,
-                    Some(key.checkpoint),
-                )
-            })
-            .collect();
-        seed_package_versions(&db, &schema, &rows);
+        seed_package_versions(&db, &schema, &published_package_versions());
         seed_index(&db, &schema, &[publishes()[1], publishes()[4]]);
+        forget_build(&db, &schema);
 
         // Six eligible rows in chunks of four exercise both a full-chunk
         // flush and the final partial chunk; only the four missing rows
-        // are written.
+        // are written, and the build records that it completed.
         assert_eq!(
             schema
                 .build_packages_by_checkpoint_in_chunks(&db, 4)
@@ -384,27 +420,41 @@ mod tests {
             4,
         );
         assert_eq!(index_rows(&schema), publishes());
+        assert!(schema.packages_by_checkpoint_built().unwrap());
+
+        // In chunks of three the last chunk is empty and nothing is
+        // missing; the build still records that it completed.
+        forget_build(&db, &schema);
         assert_eq!(
             schema
-                .build_packages_by_checkpoint_in_chunks(&db, 4)
+                .build_packages_by_checkpoint_in_chunks(&db, 3)
                 .unwrap(),
             0,
         );
+        assert!(schema.packages_by_checkpoint_built().unwrap());
     }
 
     #[test]
-    fn opening_a_database_fills_in_missing_index_rows() {
+    fn opening_a_fresh_database_records_the_build() {
+        let (_dir, _db, schema) = fresh_db();
+        assert!(schema.packages_by_checkpoint_built().unwrap());
+        assert!(index_rows(&schema).is_empty());
+    }
+
+    #[test]
+    fn opening_builds_the_index_once() {
         let dir = tempfile::tempdir().unwrap();
         let open = || Db::open::<RpcStoreSchema>(dir.path(), DbOptions::default()).unwrap();
         {
-            // `package_versions` populated without the index (as by a
-            // binary that predates it).
+            // `package_versions` populated without the index or its
+            // completion row (as by a binary that predates both).
             let (db, schema) = open();
             seed_package_versions(
                 &db,
                 &schema,
                 &[(A, 1, A, Some(5)), (A, 2, A_V2, Some(9)), (B, 1, B, None)],
             );
+            forget_build(&db, &schema);
             assert!(index_rows(&schema).is_empty());
         }
         {
@@ -413,19 +463,39 @@ mod tests {
                 index_rows(&schema),
                 vec![(key(5, A, 1), A), (key(9, A, 2), A_V2)],
             );
-            // Drop one index row, as an interrupted build would leave it
-            // missing.
+            assert!(schema.packages_by_checkpoint_built().unwrap());
+            // Drop an index row and add a `package_versions` row with no
+            // index row. A rebuild would restore the first and add the
+            // second.
             let mut batch = db.batch();
             batch
                 .delete(&schema.packages_by_checkpoint, &key(9, A, 2))
                 .unwrap();
             batch.commit().unwrap();
+            seed_package_versions(&db, &schema, &[(C, 1, C, Some(12))]);
+        }
+
+        // The completion row is present, so the open does not rebuild.
+        let (_db, schema) = open();
+        assert_eq!(index_rows(&schema), vec![(key(5, A, 1), A)]);
+        assert!(schema.packages_by_checkpoint_built().unwrap());
+    }
+
+    #[test]
+    fn opening_completes_an_interrupted_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || Db::open::<RpcStoreSchema>(dir.path(), DbOptions::default()).unwrap();
+        {
+            // Some chunks of the build committed, and the crash came
+            // before the last chunk wrote the completion row.
+            let (db, schema) = open();
+            seed_package_versions(&db, &schema, &published_package_versions());
+            seed_index(&db, &schema, &publishes()[..3]);
+            forget_build(&db, &schema);
         }
 
         let (_db, schema) = open();
-        assert_eq!(
-            index_rows(&schema),
-            vec![(key(5, A, 1), A), (key(9, A, 2), A_V2)],
-        );
+        assert_eq!(index_rows(&schema), publishes());
+        assert!(schema.packages_by_checkpoint_built().unwrap());
     }
 }
